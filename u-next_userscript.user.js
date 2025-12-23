@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         U-Next Manga Downloader
-// @version      1.0.0
+// @version      1.1.0
 // @namespace    https://github.com/manti-X/U-Next_Manga_Downloader
 // @description  Decrypt and download .ubook (Manga) from U-Next
 // @author       manti
@@ -44,8 +44,9 @@
     'use strict';
 
     function getReactFiber(node) {
+        if (!node) return null;
         const key = Object.keys(node).find(key => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$"));
-        return node[key];
+        return node ? node[key] : null;
     }
 
     function base64ToUint8Array(base64) {
@@ -63,61 +64,93 @@
         console.log(`%c[UBook Decrypt] ${msg}`, `color:${color}; font-weight:bold;`);
     };
 
-    async function getBookData() {
-        const el = document.querySelector('.swiper');
-        if (!el) throw new Error("Viewer element (.swiper) not found. Is the book open?");
+    function getManager() {
+    const el = document.querySelector('.swiper');
+    if (!el) throw new Error("Viewer element (.swiper) not found. Is the book open?");
 
-        const fiber = getReactFiber(el);
-        if (!fiber) throw new Error("Could not access React internals.");
+    const fiber = getReactFiber(el);
+    if (!fiber) throw new Error("Could not access React internals.");
 
-        let curr = fiber;
-        let manager = null;
-        while (curr) {
-            if (curr.memoizedProps && curr.memoizedProps.manager) {
-                manager = curr.memoizedProps.manager;
-                break;
+    let curr = fiber;
+    while (curr) {
+        if (curr.memoizedProps && curr.memoizedProps.manager) {
+            return curr.memoizedProps.manager;
+        }
+        curr = curr.return;
+    }
+
+    throw new Error("DRM Manager not found.");
+}
+
+    async function preloadKeys(manager) {
+        const parser = manager.parser;
+        const drmContext = parser.drmContext;
+        
+        if (!parser.drmParser || !parser.drmParser.drmHeader) {
+            log("DRM Manager not found.", "error");
+            return;
+        }
+
+        const fileList = parser.drmParser.drmHeader.encryptedFileList;
+        const requiredKeyIds = new Set();
+        const keyIdToFilePath = {};
+
+        for (const [path, info] of Object.entries(fileList)) {
+            if (info.keyId) {
+                requiredKeyIds.add(info.keyId);
+                if (!keyIdToFilePath[info.keyId]) {
+                    keyIdToFilePath[info.keyId] = path;
+                }
             }
-            curr = curr.return;
         }
 
-        if (!manager || !manager.parser) throw new Error("DRM Manager not found.");
+        const loadedKeys = Object.keys(drmContext.keys);
+        const missingKeyIds = [...requiredKeyIds].filter(k => !loadedKeys.includes(k));
 
-        const drmContext = manager.parser.drmContext;
-        const keys = drmContext.keys;
-        const keyIds = Object.keys(keys);
-
-        if (keyIds.length === 0) throw new Error("No keys loaded. Try to flip a page.");
-
-        const keyMap = {};
-        for (const kid of keyIds) {
-            const cryptoKey = keys[kid];
-            const rawKey = await window.crypto.subtle.exportKey("raw", cryptoKey);
-            keyMap[kid] = rawKey;
+        if (missingKeyIds.length === 0) {
+            log("All necessary keys are already loaded.", "success");
+            return;
         }
 
-        const bookUrl = manager.parser.url;
-        if (!bookUrl) throw new Error("Could not find Book URL.");
+        log(`Need to fetch ${missingKeyIds.length} missing keys...`);
+        const btn = document.getElementById('ubook-dl-btn');
+        if(btn) btn.innerText = `Fetching ${missingKeyIds.length} Keys...`;
 
-        return { keyMap, bookUrl };
+        const promises = missingKeyIds.map(async (kid) => {
+            const sampleFile = keyIdToFilePath[kid];
+            try {
+                await parser.getBinaryObject(sampleFile);
+                log(`Fetched key for: ${sampleFile}`, "success");
+            } catch (e) {
+                console.warn(`Failed to preload key for ${sampleFile}`, e);
+            }
+        });
+
+        await Promise.all(promises);
+        log("Key preloading complete.");
     }
 
     async function processAndDownload() {
         const btn = document.getElementById('ubook-dl-btn');
         btn.disabled = true;
-        btn.innerText = "Initializing...";
 
         try {
-            const { keyMap, bookUrl } = await getBookData();
+            const manager = getManager();
+            const bookUrl = manager.parser.url;
 
-           const cryptoKeyMap = {};
-            for (const [kid, raw] of Object.entries(keyMap)) {
-                cryptoKeyMap[kid] = await window.crypto.subtle.importKey(
-                    "raw",
-                    raw,
-                    "AES-CBC",
-                    false,
-                    ["decrypt"]
-                );
+            await preloadKeys(manager);
+
+            const context = manager.parser.drmContext;
+            const keys = context.keys;
+            const keyIds = Object.keys(keys);
+            
+            if (keyIds.length === 0) throw new Error("No keys loaded. Preloading failed.");
+
+            const keyMap = {};
+            for (const kid of keyIds) {
+                const cryptoKey = keys[kid];
+                const rawKey = await window.crypto.subtle.exportKey("raw", cryptoKey);
+                keyMap[kid] = await window.crypto.subtle.importKey("raw", rawKey, "AES-CBC", false, ["decrypt"]);
             }
 
             btn.innerText = "Downloading Book...";
@@ -136,10 +169,7 @@
             const files = drmJson.encryptedFileList;
             const totalFiles = Object.keys(files).length;
 
-            log(`Found ${totalFiles} encrypted files. Starting decryption...`);
-
             let processed = 0;
-            let errors = 0;
 
             for (const [filepath, info] of Object.entries(files)) {
                 processed++;
@@ -151,13 +181,10 @@
                 const encryptedBytes = await fileInZip.async("uint8array");
                 const iv = base64ToUint8Array(info.iv);
                 const originalSize = info.originalFileSize;
-                const keyId = info.keyId;
 
-                const aesKey = cryptoKeyMap[keyId];
-
+                const aesKey = keyMap[info.keyId];
                 if (!aesKey) {
-                    console.warn(`Missing key for ${filepath} (KeyID: ${keyId}). Skipping.`);
-                    errors++;
+                    console.error(`Key missing for ${filepath}`);
                     continue;
                 }
 
@@ -177,12 +204,7 @@
 
                 } catch (e) {
                     console.error(`Failed to decrypt ${filepath}`, e);
-                    errors++;
                 }
-            }
-
-            if (errors > 0) {
-                alert(`${errors} files failed to decrypt. \nPossible cause: You didn't scroll through all pages to load all keys.`);
             }
 
             zip.remove("drm.json");
@@ -219,19 +241,21 @@
                 const btn = document.createElement('button');
                 btn.id = 'ubook-dl-btn';
                 btn.innerText = "Download Decrypted ZIP";
-                btn.style.position = 'fixed';
-                btn.style.bottom = '20px';
-                btn.style.right = '20px';
-                btn.style.zIndex = '99999';
-                btn.style.padding = '10px 15px';
-                btn.style.backgroundColor = '#007aff';
-                btn.style.color = 'white';
-                btn.style.border = 'none';
-                btn.style.borderRadius = '5px';
-                btn.style.cursor = 'pointer';
-                btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.3)';
-                btn.style.fontWeight = 'bold';
-                btn.style.fontSize = '14px';
+                Object.assign(btn.style, {
+                    position: 'fixed',
+                    bottom: '20px',
+                    right: '20px',
+                    zIndex: '99999',
+                    padding: '10px 15px',
+                    backgroundColor: '#007aff',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '5px',
+                    cursor: 'pointer',
+                    boxShadow: '0 2px 5px rgba(0,0,0,0.3)',
+                    fontWeight: 'bold',
+                    fontSize: '14px'
+                });
 
                 btn.onclick = processAndDownload;
 
@@ -267,14 +291,11 @@
 
                 document.body.appendChild(link);
             }
-        }
-
-        else {
+        } else {
             if (dlBtn) dlBtn.remove();
             if (kofiBtn) kofiBtn.remove();
         }
     }
 
     setInterval(manageUI, 1000);
-
 })();
